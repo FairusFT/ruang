@@ -10,9 +10,10 @@ import { API_VERSION } from './api-version.js'
 import { collectMemory } from './memory.js'
 import { getActivity, getCalendar, getChannels, getCommandLog, getDashboard, getKnowledge, getLogs, getOffice, getSnapshot, getTaskBoard, getTaskDetail, getUsage } from './mission-control.js'
 
-const HOST = '127.0.0.1'
+const HOST = process.env.RUANG_HOST ?? '0.0.0.0'
 // MISSION_CONTROL_PORT is the pre-rename name, still honoured.
-const PORT = Number(process.env.RUANG_PORT ?? process.env.MISSION_CONTROL_PORT) || 3001
+// Local copy: default 3002 (3000 = tka-quiz, 3001 = portfolio).
+const PORT = Number(process.env.RUANG_PORT ?? process.env.MISSION_CONTROL_PORT) || 3002
 // The built UI sits next to the server: ../dist from server/*.ts (development, npm start)
 // and ../../dist from build/server/*.js (the installed package).
 const distDirectory = [new URL('../dist', import.meta.url), new URL('../../dist', import.meta.url)].map((url) => fileURLToPath(url)).find((path) => existsSync(join(path, 'index.html'))) ?? fileURLToPath(new URL('../dist', import.meta.url))
@@ -74,7 +75,7 @@ app.get('/api/tasks/:id', async (request, response) => {
 // (every Hermes profile this machine reports, and OpenCode when installed) can be opened.
 async function agentFolders() {
   const runtime = await getSnapshot()
-  return resolveAgentFolders(runtime.profiles.data.map((profile) => profile.name))
+  return resolveAgentFolders(runtime.profiles.availability === 'available' ? runtime.profiles.data : [])
 }
 async function openFolder(profile: string) {
   const folders = await agentFolders()

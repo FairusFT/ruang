@@ -229,22 +229,23 @@ async function firstDirectory(candidates: string[]): Promise<{ directory: string
  * A non-default agent that resolves to the Hermes root, or to another agent's folder, is not
  * opened: it would show files that are not its own.
  */
-export async function resolveAgentFolders(profiles: string[], env: NodeJS.ProcessEnv = process.env, home = homedir()): Promise<AgentFolder[]> {
+export async function resolveAgentFolders(profiles: readonly (string | { name: string; displayName?: string })[], env: NodeJS.ProcessEnv = process.env, home = homedir()): Promise<AgentFolder[]> {
   const root = hermesRoot(env, home)
   // Every Hermes profile this machine reports; `default` always exists in Hermes, so it is the
-  // fallback when the profile list cannot be read.
-  const listed = profiles.filter((name) => name !== 'opencode' && PROFILE_NAME.test(name))
-  const names = [...new Set(listed.length ? listed : ['default'])]
+  // fallback when the profile list cannot be read. A display name (when set) is the label.
+  const entries = profiles.map((profile) => (typeof profile === 'string' ? { name: profile, displayName: undefined } : profile)).filter((entry) => entry.name !== 'opencode' && PROFILE_NAME.test(entry.name))
+  const unique = [...new Map(entries.map((entry) => [entry.name, entry])).values()]
+  const listed = unique.length ? unique : [{ name: 'default', displayName: undefined }]
   const specs = [
-    ...names.map((profile) => ({ profile, candidates: profile === 'default' ? [path.join(root, 'profiles', 'default'), root] : [path.join(root, 'profiles', profile)] })),
-    { profile: 'opencode', candidates: (env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR) ? [path.resolve((env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR)!)] : [path.join(home, '.opencode'), path.join(home, '.config', 'opencode')] },
+    ...listed.map((entry) => ({ profile: entry.name, label: entry.displayName && entry.displayName !== entry.name ? entry.displayName : entry.name, candidates: entry.name === 'default' ? [path.join(root, 'profiles', 'default'), root] : [path.join(root, 'profiles', entry.name)] })),
+    { profile: 'opencode', label: 'opencode', candidates: (env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR) ? [path.resolve((env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR)!)] : [path.join(home, '.opencode'), path.join(home, '.config', 'opencode')] },
   ]
   const realRoot = await realpath(root).catch(() => root)
   const claimed = new Map<string, string>()
   const folders: AgentFolder[] = []
   for (const spec of specs) {
     const { directory, real, denied } = await firstDirectory(spec.candidates)
-    const label = spec.profile
+    const label = spec.label
     const base = { profile: spec.profile, label, path: displayPath(directory, home), directory: real ?? directory }
     // OpenCode is optional: without its folder it is simply not listed.
     if (!real && spec.profile === 'opencode' && !denied) continue

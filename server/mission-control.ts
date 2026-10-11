@@ -4,7 +4,7 @@ import { promisify } from 'node:util'
 const execFile = promisify(execFileCallback)
 const CACHE_MS = 10_000
 const INSIGHTS_CACHE_MS = 60_000
-const COMMAND_TIMEOUT_MS = 8_000
+const COMMAND_TIMEOUT_MS = 15_000
 const COMMAND_LOG_LIMIT = 100
 const LOG_TAIL_LINES = 200
 
@@ -12,7 +12,7 @@ export type Availability = 'available' | 'unavailable'
 export type GatewayState = 'Running' | 'Stopped' | 'Unknown'
 
 /** A Hermes profile; every profile is one agent. `gateway` comes from the profile list. */
-export interface Profile { name: string; model: string; gateway: GatewayState }
+export interface Profile { name: string; displayName?: string; model: string; gateway: GatewayState }
 export interface Source<T> {
   availability: Availability
   data: T
@@ -26,7 +26,7 @@ export interface RuntimeSnapshot {
 export interface Task { title: string; status: string; id?: string; assignee?: string; priority?: number; board?: string; /** Belongs to a locked agent (profile lock): the title is withheld. */ private?: boolean }
 export interface KanbanBoard { slug: string; name: string; current: boolean; total: number }
 /** `agent` is the Hermes profile the job belongs to (cron jobs are stored per profile). */
-export interface ScheduledJob { /** Belongs to a locked agent (profile lock): the name is withheld. */ private?: boolean; name: string; schedule: string; id?: string; nextRun?: string; overdue?: boolean; status?: string; repeat?: string; lastRun?: string; lastRunOk?: boolean; agent?: string }
+export interface ScheduledJob { /** Belongs to a locked agent (profile lock): the name is withheld. */ private?: boolean; name: string; schedule: string; id?: string; nextRun?: string; overdue?: boolean; status?: string; repeat?: string; lastRun?: string; lastRunOk?: boolean; agent?: string; /** The agent profile's display name, when it has one. */ agentLabel?: string }
 export interface Session { title: string; preview: string; lastActive: string; id?: string; workspace?: string; source?: string; actor?: string; active?: boolean }
 export interface Skill { name: string; category: string; source: string; trust: string; status: 'enabled' }
 export interface TaskBoardSnapshot { tasks: Source<Task[]>; boards?: KanbanBoard[]; failedBoards?: string[]; fetchedAt: string }
@@ -82,7 +82,7 @@ export interface UsageInsights {
   /** The single session with the most tokens in the period. */
   topSession?: { tokens: number; date: string }
 }
-export interface AgentUsage { agent: string; availability: Availability; usage?: UsageInsights; error?: string }
+export interface AgentUsage { agent: string; label?: string; availability: Availability; usage?: UsageInsights; error?: string }
 export interface UsageTotals { sessions: number; messages: number; toolCalls: number; inputTokens: number; outputTokens: number; totalTokens: number; costUsd?: number }
 export interface UsageSnapshot {
   days: number
@@ -160,10 +160,12 @@ function profileRows(output: string): ProfileRow[] {
     if (!match) return []
     // A display name renders as "Display Name (id)"; the id is the stable profile name.
     const displayed = match[1].trim()
-    const name = displayed.match(/\(([\w.-]+)\)$/)?.[1] ?? displayed
+    const idMatch = displayed.match(/^(.+?)\s*\(([\w.-]+)\)$/)
+    const name = idMatch ? idMatch[2] : displayed
+    const displayName = idMatch && idMatch[1].trim() !== name ? idMatch[1].trim() : undefined
     const model = match[2] === '—' ? 'Not configured' : match[2]
     const gateway: GatewayState = withGateway ? (withGateway[3].toLowerCase() === 'running' ? 'Running' : 'Stopped') : 'Unknown'
-    return [{ name, model, gateway }]
+    return [{ name, ...(displayName ? { displayName } : {}), model, gateway }]
   })
 }
 
@@ -241,7 +243,7 @@ const CRON_FIELD = /^\s{2,}(Name|Schedule|Repeat|Next run|Overdue|Last run):\s*(
 
 export function parseCronJobs(output: string): ScheduledJob[] {
   const clean = stripAnsi(output)
-  if (/^\s*No scheduled jobs\./im.test(clean)) return []
+  if (/^\s*No scheduled jobs\b/im.test(clean)) return []
   const jobs: ScheduledJob[] = []
   let current: (Partial<ScheduledJob> & { id: string; status: string }) | undefined
   const flush = () => {
@@ -463,7 +465,7 @@ async function systemRun(file: string, args: string[], options: RunOptions = {})
     return stdout
   } catch (error) {
     const failure = describeFailure(error)
-    const benign = options.benign?.test(failure.stdout) ?? false
+    const benign = options.benign ? (options.benign.test(failure.stdout) || options.benign.test(failure.message)) : false
     recordCommand({ command, ok: benign, durationMs: Date.now() - started, at: new Date(started).toISOString(), ...(benign ? {} : { error: failure.message }) })
     throw failure
   }
@@ -488,9 +490,9 @@ function failure<T>(error: unknown, fallback: T): Source<T> {
   return { availability: 'unavailable', data: fallback, error: { code, message: code === 'TIMEOUT' ? 'Read timed out.' : message } }
 }
 
-async function read<T>(run: Run, file: string, args: string[], parse: (output: string) => T, fallback: T): Promise<Source<T>> {
+async function read<T>(run: Run, file: string, args: string[], parse: (output: string) => T, fallback: T, options?: RunOptions): Promise<Source<T>> {
   try {
-    return { availability: 'available', data: parse(await run(file, args)) }
+    return { availability: 'available', data: parse(await run(file, args, options)) }
   } catch (error) {
     return failure(error, fallback)
   }
@@ -502,10 +504,13 @@ async function read<T>(run: Run, file: string, args: string[], parse: (output: s
 /** Profile names passed to `hermes -p`: plain names only, never anything that looks like an option. */
 export const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 
+/** OpenCode is optional: a missing binary is an expected absence, not a failed read. */
+const OPENCODE_MISSING = /not installed|not on PATH/i
+
 export async function collectSnapshot(run: Run = systemRun): Promise<RuntimeSnapshot> {
   const [profiles, openCode] = await Promise.all([
     read(run, 'hermes', ['profile', 'list'], parseProfiles, []),
-    read(run, 'opencode', ['--version'], (value) => value.trim().split('\n').pop()?.trim() || 'Unknown', 'Unknown'),
+    read(run, 'opencode', ['--version'], (value) => value.trim().split('\n').pop()?.trim() || 'Unknown', 'Unknown', { benign: OPENCODE_MISSING }),
   ])
   return { profiles, openCode, fetchedAt: new Date().toISOString() }
 }
@@ -553,13 +558,16 @@ export async function collectTaskBoard(run: Run = systemRun): Promise<TaskBoardS
 export async function collectCalendar(run: Run = systemRun): Promise<CalendarSnapshot> {
   const fetchedAt = new Date().toISOString()
   const profiles = await read(run, 'hermes', ['profile', 'list'], parseProfiles, [])
-  const names = profiles.availability === 'available' ? profiles.data.map((profile) => profile.name).filter((name) => PROFILE_NAME.test(name)) : []
+  const listed = profiles.availability === 'available' ? profiles.data.filter((profile) => PROFILE_NAME.test(profile.name)) : []
+  const names = listed.map((profile) => profile.name)
+  const displayNames = new Map(listed.filter((profile) => profile.displayName).map((profile) => [profile.name, profile.displayName as string]))
   if (names.length === 0) return { jobs: await read(run, 'hermes', ['cron', 'list', '--all'], parseCronJobs, []), fetchedAt }
   const results = await Promise.all(names.map((name) => read(run, 'hermes', ['-p', name, 'cron', 'list', '--all'], parseCronJobs, [])))
   if (results.every((result) => result.availability !== 'available')) return { jobs: results[0], fetchedAt }
-  const jobs = results.flatMap((result, index) => result.availability === 'available' ? result.data.map((job) => ({ ...job, agent: names[index] })) : [])
+  const jobs = results.flatMap((result, index) => result.availability === 'available' ? result.data.map((job) => ({ ...job, agent: names[index], ...(displayNames.get(names[index]) ? { agentLabel: displayNames.get(names[index]) } : {}) })) : [])
   const failedProfiles = names.filter((_, index) => results[index].availability !== 'available')
-  return { jobs: { availability: 'available', data: jobs }, ...(failedProfiles.length ? { failedProfiles } : {}), fetchedAt }
+  const failedLabels = failedProfiles.map((id) => displayNames.get(id) ?? id)
+  return { jobs: { availability: 'available', data: jobs }, ...(failedProfiles.length ? { failedProfiles: failedLabels } : {}), fetchedAt }
 }
 
 export async function collectActivity(run: Run = systemRun): Promise<ActivitySnapshot> {
@@ -604,11 +612,12 @@ function mergeRows<K extends 'model' | 'source'>(key: K, rows: ({ [P in K]: stri
  * Token usage of every agent. Hermes keeps sessions per profile, so `hermes insights` only
  * covers the active one; each profile is read with `-p` (at most four at a time) and summed.
  */
-export async function collectUsage(days: number, profiles: readonly string[], run: Run = systemRun): Promise<UsageSnapshot> {
-  const names = profiles.filter((name) => PROFILE_NAME.test(name))
-  const agents = await mapLimit(names.length > 0 ? names : ['default'], USAGE_CONCURRENCY, async (agent): Promise<AgentUsage> => {
-    const result = await read<UsageInsights | null>(run, 'hermes', [...(names.length > 0 ? ['-p', agent] : []), 'insights', '--days', String(days)], (output) => parseInsights(output, days), null)
-    return result.availability === 'available' && result.data ? { agent, availability: 'available', usage: result.data } : { agent, availability: 'unavailable', error: result.error?.message ?? 'hermes insights could not be read.' }
+export async function collectUsage(days: number, profiles: readonly (string | { name: string; displayName?: string })[], run: Run = systemRun): Promise<UsageSnapshot> {
+  const entries = profiles.map((profile) => (typeof profile === 'string' ? { name: profile, displayName: undefined } : profile)).filter((profile) => PROFILE_NAME.test(profile.name))
+  const agents = await mapLimit(entries.length > 0 ? entries : [{ name: 'default', displayName: undefined }], USAGE_CONCURRENCY, async (profile): Promise<AgentUsage> => {
+    const result = await read<UsageInsights | null>(run, 'hermes', [...(entries.length > 0 ? ['-p', profile.name] : []), 'insights', '--days', String(days)], (output) => parseInsights(output, days), null)
+    const label = profile.displayName && profile.displayName !== profile.name ? { label: profile.displayName } : {}
+    return result.availability === 'available' && result.data ? { agent: profile.name, ...label, availability: 'available', usage: result.data } : { agent: profile.name, ...label, availability: 'unavailable', error: result.error?.message ?? 'hermes insights could not be read.' }
   })
   const readable = agents.flatMap((agent) => (agent.usage ? [agent.usage] : []))
   const sum = (field: 'sessions' | 'messages' | 'toolCalls' | 'inputTokens' | 'outputTokens' | 'totalTokens') => readable.reduce((total, usage) => total + usage[field], 0)
@@ -819,11 +828,11 @@ export async function collectAgentActivity(profiles: readonly string[], run: Run
 // Office
 
 /** One office station per agent: every Hermes profile, plus OpenCode when it is installed. */
-interface AgentSpec { id: string; role: string; profile?: string; gateway?: GatewayState; aliases: string[] }
+interface AgentSpec { id: string; label?: string; role: string; profile?: string; gateway?: GatewayState; aliases: string[] }
 
 export function agentRoster(runtime: RuntimeSnapshot): AgentSpec[] {
   const profiles = runtime.profiles.availability === 'available' ? runtime.profiles.data : []
-  const agents: AgentSpec[] = profiles.filter((profile) => PROFILE_NAME.test(profile.name)).map((profile) => ({ id: profile.name, role: 'Hermes profile', profile: profile.name, gateway: profile.gateway, aliases: [profile.name.toLowerCase()] }))
+  const agents: AgentSpec[] = profiles.filter((profile) => PROFILE_NAME.test(profile.name)).map((profile) => ({ id: profile.name, ...(profile.displayName ? { label: profile.displayName } : {}), role: 'Hermes profile', profile: profile.name, gateway: profile.gateway, aliases: [profile.name.toLowerCase(), ...(profile.displayName ? [profile.displayName.toLowerCase()] : [])] }))
   if (runtime.openCode.availability === 'available' && !agents.some((agent) => agent.id === 'opencode')) agents.push({ id: 'opencode', role: 'OpenCode', aliases: ['opencode', 'open-code'] })
   return agents
 }
@@ -935,7 +944,7 @@ export function buildOfficeSnapshot(runtime: RuntimeSnapshot, board: TaskBoardSn
     const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? `hermes -p ${agent.profile} logs/sessions` : 'agent logs mentioning OpenCode'}, last ${ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
     return {
       id: agent.id,
-      name: agent.id,
+      name: agent.label ?? agent.id,
       role: agent.role,
       ...roomForState(state, index),
       seat: index + 1,
@@ -999,7 +1008,7 @@ const calendarSource = cachedSource(() => collectCalendar())
 const activitySource = cachedSource(() => collectActivity())
 const knowledgeSource = cachedSource(() => collectKnowledge())
 const channelSource = cachedSource(() => collectChannels())
-const usageSources = new Map(USAGE_PERIODS.map((days) => [days, cachedSource(async () => collectUsage(days, (await getSnapshot()).profiles.data.map((profile) => profile.name)), INSIGHTS_CACHE_MS)]))
+const usageSources = new Map(USAGE_PERIODS.map((days) => [days, cachedSource(async () => collectUsage(days, (await getSnapshot()).profiles.data), INSIGHTS_CACHE_MS)]))
 
 /** Token usage of every agent over 1, 7 or 30 days (anything else reads as 7). */
 export function getUsage(days: number, now = Date.now()): Promise<UsageSnapshot> {

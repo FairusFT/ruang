@@ -56,6 +56,8 @@ describe('month entries', () => {
 
   it('keeps the owning agent on every entry', () => {
     const entries = october([job({ name: 'Nightly review', schedule: '30 22 * * *', agent: 'coder' })])
-    expect(entries.get('2026-10-01')).toEqual([{ agent: 'coder', job: 'Nightly review', kind: 'run', label: '22:30' }])
+    expect(entries.get('2026-10-01')).toEqual([{ agent: 'coder', agentLabel: 'coder', job: 'Nightly review', kind: 'run', label: '22:30' }])
+    const named = october([job({ name: 'Nightly review', schedule: '30 22 * * *', agent: 'coder', agentLabel: 'Code Helper' })])
+    expect(named.get('2026-10-01')).toEqual([{ agent: 'coder', agentLabel: 'Code Helper', job: 'Nightly review', kind: 'run', label: '22:30' }])
   })
 })

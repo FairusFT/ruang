@@ -48,3 +48,8 @@ export function formatBytes(bytes: number): string {
 export function agentLabel(profile: string | undefined): string {
   return profile ?? 'Hermes'
 }
+
+/** Display name for a profile-shaped object: its display name when set, else its id. */
+export function agentLabelFor(agent: { name?: string; displayName?: string } | undefined): string {
+  return agent?.displayName ?? agent?.name ?? 'Hermes'
+}
